@@ -1,0 +1,124 @@
+// Package proxy implements the local HTTP proxy server that forwards client
+// traffic through a Hola tunnel. It supports both CONNECT (HTTPS tunnels) and
+// plain HTTP forwarding.
+package proxy
+
+import (
+	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/NeozonS/hola-proxy/internal/core"
+	"github.com/NeozonS/hola-proxy/internal/dns"
+	"github.com/NeozonS/hola-proxy/internal/log"
+	"github.com/NeozonS/hola-proxy/internal/tunnel"
+)
+
+const badReqMsg = "Bad Request\n"
+
+// Handler is the http.Handler that serves the local proxy. The dialer
+// argument to NewHandler is the CONNECT-side dialer; requestDialer is the
+// TLS-only dialer used for plain HTTP forwarding (HTTP/1.1 + Proxy-Authorization).
+type Handler struct {
+	logger        *log.CondLogger
+	dialer        core.ContextDialer
+	httptransport http.RoundTripper
+	auth          core.AuthProvider
+}
+
+func NewHandler(dialer, requestDialer core.ContextDialer, auth core.AuthProvider, resolver *dns.Resolver, logger *log.CondLogger) *Handler {
+	dialer = tunnel.NewRetryDialer(dialer, resolver, logger)
+	httptransport := &http.Transport{
+		Proxy: func(_ *http.Request) (*url.URL, error) {
+			return &url.URL{Scheme: "http", Host: "void"}, nil
+		},
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		DialContext:           requestDialer.DialContext,
+	}
+	return &Handler{
+		logger:        logger,
+		dialer:        dialer,
+		auth:          auth,
+		httptransport: httptransport,
+	}
+}
+
+func (s *Handler) HandleTunnel(wr http.ResponseWriter, req *http.Request) {
+	ctx := req.Context()
+	conn, err := s.dialer.DialContext(ctx, "tcp", req.RequestURI)
+	if err != nil {
+		s.logger.Error("Can't satisfy CONNECT request: %v", err)
+		http.Error(wr, "Can't satisfy CONNECT request", http.StatusBadGateway)
+		return
+	}
+
+	if req.ProtoMajor == 0 || req.ProtoMajor == 1 {
+		// Upgrade client connection
+		localconn, _, err := hijack(wr)
+		if err != nil {
+			s.logger.Error("Can't hijack client connection: %v", err)
+			http.Error(wr, "Can't hijack client connection", http.StatusInternalServerError)
+			return
+		}
+		defer localconn.Close()
+
+		// Inform client connection is built
+		fmt.Fprintf(localconn, "HTTP/%d.%d 200 OK\r\n\r\n", req.ProtoMajor, req.ProtoMinor)
+
+		copyTwoWay(req.Context(), localconn, conn)
+	} else if req.ProtoMajor == 2 {
+		wr.Header()["Date"] = nil
+		wr.WriteHeader(http.StatusOK)
+		flush(wr)
+		proxyH2(req.Context(), req.Body, wr, conn)
+	} else {
+		s.logger.Error("Unsupported protocol version: %s", req.Proto)
+		http.Error(wr, "Unsupported protocol version.", http.StatusBadRequest)
+		return
+	}
+}
+
+func (s *Handler) HandleRequest(wr http.ResponseWriter, req *http.Request) {
+	req.RequestURI = ""
+	if req.ProtoMajor == 2 {
+		req.URL.Scheme = "http" // We can't access :scheme pseudo-header, so assume http
+		req.URL.Host = req.Host
+	}
+	delHopHeaders(req.Header)
+	req.Header.Add("Proxy-Authorization", s.auth())
+	resp, err := s.httptransport.RoundTrip(req)
+	if err != nil {
+		s.logger.Error("HTTP fetch error: %v", err)
+		http.Error(wr, "Server Error", http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+	s.logger.Info("%v %v %v %v", req.RemoteAddr, req.Method, req.URL, resp.Status)
+	delHopHeaders(resp.Header)
+	copyHeader(wr.Header(), resp.Header)
+	wr.WriteHeader(resp.StatusCode)
+	flush(wr)
+	copyBody(wr, resp.Body)
+}
+
+func (s *Handler) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
+	s.logger.Info("Request: %v %v %v %v", req.RemoteAddr, req.Proto, req.Method, req.URL)
+
+	isConnect := strings.ToUpper(req.Method) == "CONNECT"
+	if (req.URL.Host == "" || req.URL.Scheme == "" && !isConnect) && req.ProtoMajor < 2 ||
+		req.Host == "" && req.ProtoMajor == 2 {
+		http.Error(wr, badReqMsg, http.StatusBadRequest)
+		return
+	}
+	delHopHeaders(req.Header)
+	if isConnect {
+		s.HandleTunnel(wr, req)
+	} else {
+		s.HandleRequest(wr, req)
+	}
+}

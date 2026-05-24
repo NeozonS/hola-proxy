@@ -1,0 +1,33 @@
+name: hola-proxy
+summary: Standalone Hola proxy client.
+description: |
+  Standalone Hola proxy client. Just run it and it'll start plain HTTP proxy server forwarding traffic via Hola proxies of your choice.
+
+confinement: strict
+base: core22
+adopt-info: hola-proxy
+
+parts:
+  hola-proxy:
+    plugin: go
+    build-snaps: [go/latest/stable]
+    build-packages:
+      - make
+      - git-core
+    source: https://github.com/NeozonS/hola-proxy
+    source-type: git
+    override-pull: |
+      craftctl default
+      craftctl set version="$(git describe --long --tags --always --match=v*.*.* | sed 's/v//')"
+    override-build:
+      make &&
+      cp bin/hola-proxy "$SNAPCRAFT_PART_INSTALL"
+    stage:
+      - hola-proxy
+
+apps:
+  hola-proxy:
+    command: hola-proxy
+    plugs:
+      - network
+      - network-bind
