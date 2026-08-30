@@ -23,7 +23,7 @@ const chromeVerURL = "https://versionhistory.googleapis.com/v1/chrome/platforms/
 
 // GetChromeVer returns the latest stable Chrome version for Windows.
 func GetChromeVer(ctx context.Context, dialer core.ContextDialer) (string, error) {
-	httpClient := surfclient.New(dialer, nil)
+	httpClient := surfclient.New(surfclient.Options{Dialer: dialer})
 	defer httpClient.CloseIdleConnections()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", chromeVerURL, nil)

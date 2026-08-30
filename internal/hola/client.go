@@ -8,20 +8,23 @@ package hola
 
 import (
 	"crypto/x509"
+	"net/http"
 	"sync"
 	"text/template"
 
 	"github.com/NeozonS/hola-proxy/internal/core"
+	"github.com/NeozonS/hola-proxy/internal/surfclient"
 )
 
 const (
-	extBrowser       = "chrome"
-	product          = "cws"
-	ccgiURL          = "https://client.hola.org/client_cgi/"
-	vpnCountriesURL  = ccgiURL + "vpn_countries.json"
-	bgInitURL        = ccgiURL + "background_init"
-	zgetTunnelsURL   = ccgiURL + "zgettunnels"
-	agentSuffix      = ".hola.org"
+	extBrowser      = "chrome"
+	product         = "cws"
+	ccgiURL         = "https://client.hola.org/client_cgi/"
+	vpnCountriesURL = ccgiURL + "vpn_countries.json"
+	bgInitURL       = ccgiURL + "background_init"
+	zgetTunnelsURL  = ccgiURL + "zgettunnels"
+	agentSuffix     = ".hola.org"
+	extOrigin       = surfclient.HolaExtOrigin
 )
 
 // fallbackConfURLs hold encrypted fallback configurations used when the main
@@ -34,8 +37,10 @@ var fallbackConfURLs = []string{
 
 var loginTemplate = template.Must(template.New("LOGIN_TEMPLATE").Parse("user-uuid-{{.uuid}}-is_prem-{{.prem}}"))
 
-// Config carries everything required to construct a Client. UserAgent and
-// Dialer are mandatory; RootCAs and ExtVer are optional but typically set.
+// Config carries everything required to construct a Client. Dialer is
+// typically set; RootCAs, ExtVer and UserAgent are optional. An empty
+// UserAgent keeps the UA from the Windows Chrome impersonate profile so it
+// stays aligned with TLS / HTTP2 / sec-ch-ua.
 type Config struct {
 	UserAgent string
 	Dialer    core.ContextDialer
@@ -46,14 +51,23 @@ type Config struct {
 // Client is the per-process Hola API client. It is safe for concurrent use.
 type Client struct {
 	cfg       Config
+	http      *http.Client
 	fbcMux    sync.Mutex
 	cachedFBC *FallbackConfig
 }
 
-// NewClient builds a Client. The caller is expected to populate cfg.UserAgent
-// and cfg.Dialer; if Dialer is nil, surf's default dialer is used.
+// NewClient builds a Client. A single surf Session is kept for the process
+// lifetime so background_init and zgettunnels share cookies and TLS tickets.
 func NewClient(cfg Config) *Client {
-	return &Client{cfg: cfg}
+	c := &Client{cfg: cfg}
+	c.http = surfclient.New(surfclient.Options{
+		Dialer:          cfg.Dialer,
+		RootCAs:         cfg.RootCAs,
+		UserAgent:       cfg.UserAgent,
+		ExtensionOrigin: extOrigin,
+		Session:         true,
+	})
+	return c
 }
 
 // UserAgent returns the User-Agent string injected into every Hola API

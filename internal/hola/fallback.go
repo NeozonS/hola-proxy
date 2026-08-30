@@ -85,7 +85,6 @@ func (c *FallbackConfig) Clone() *FallbackConfig {
 // "rotate-by-3-then-base64" obfuscation.
 func (c *Client) fetchFallbackConfig(ctx context.Context) (*FallbackConfig, error) {
 	client := c.httpClientWithProxy(nil)
-	defer client.CloseIdleConnections()
 	url := fallbackConfURLs[rand.New(random.Source).Intn(len(fallbackConfURLs))]
 	confRaw, err := c.doReq(ctx, client, "", url, nil, nil)
 	if err != nil {

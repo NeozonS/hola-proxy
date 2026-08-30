@@ -13,8 +13,6 @@ import (
 	"github.com/NeozonS/hola-proxy/internal/surfclient"
 )
 
-const defaultProdVersion = "113.0"
-
 // ErrNoVerData is returned when the Chrome Web Store update endpoint returns
 // no version data for the requested extension.
 var ErrNoVerData = errors.New("no version data returned")
@@ -36,11 +34,11 @@ type storeExtUpdateResponse struct {
 // is used.
 func GetExtVer(ctx context.Context, prodVersion *string, id string, dialer core.ContextDialer) (string, error) {
 	if prodVersion == nil {
-		v := defaultProdVersion
+		v := surfclient.ChromeProdVersion()
 		prodVersion = &v
 	}
 
-	httpClient := surfclient.New(dialer, nil)
+	httpClient := surfclient.New(surfclient.Options{Dialer: dialer})
 	defer httpClient.CloseIdleConnections()
 
 	reqURL := (&url.URL{

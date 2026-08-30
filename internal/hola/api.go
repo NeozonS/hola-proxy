@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"math/rand"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/campoy/unique"
@@ -25,12 +27,30 @@ import (
 // with hideSNI), and only then the surf client performs its own outer TLS
 // handshake to client.hola.org.
 func (c *Client) httpClientWithProxy(agent *FallbackAgent) *http.Client {
-	dialer := c.cfg.Dialer
-	rootCAs := c.cfg.RootCAs
-	if agent != nil {
-		dialer = tunnel.NewProxyDialer(agent.NetAddr(), agent.Hostname(), rootCAs, nil, true, dialer)
+	if agent == nil {
+		return c.http
 	}
-	return surfclient.New(dialer, rootCAs)
+	rootCAs := c.cfg.RootCAs
+	dialer := tunnel.NewProxyDialer(agent.NetAddr(), agent.Hostname(), rootCAs, nil, true, c.cfg.Dialer)
+	return surfclient.New(surfclient.Options{
+		Dialer:          dialer,
+		RootCAs:         rootCAs,
+		UserAgent:       c.cfg.UserAgent,
+		ExtensionOrigin: extOrigin,
+		Session:         true,
+	})
+}
+
+// HTTPError is returned by doReq for non-2xx responses. Callers use
+// errors.As to inspect the status code (e.g. to tell rate limiting apart
+// from generic failures).
+type HTTPError struct {
+	StatusCode int
+	Status     string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("Bad HTTP response: %s", e.Status)
 }
 
 // doReq is a tiny request helper shared by the API methods. Adds the
@@ -57,7 +77,6 @@ func (c *Client) doReq(ctx context.Context, client *http.Client, method, rawURL 
 	if query != nil {
 		req.URL.RawQuery = query.Encode()
 	}
-	req.Header.Set("User-Agent", c.cfg.UserAgent)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -66,7 +85,7 @@ func (c *Client) doReq(ctx context.Context, client *http.Client, method, rawURL 
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusCreated, http.StatusAccepted, http.StatusNoContent:
 	default:
-		return nil, fmt.Errorf("Bad HTTP response: %s", resp.Status)
+		return nil, &HTTPError{StatusCode: resp.StatusCode, Status: resp.Status}
 	}
 	body, err := ioutil.ReadAll(resp.Body)
 	resp.Body.Close()
@@ -99,6 +118,19 @@ func (c *Client) vpnCountries(ctx context.Context, hc *http.Client) (CountryList
 	return res, nil
 }
 
+// banFromHTTPError maps HTTP statuses that Hola uses for rate limiting /
+// refusal (403, 429) to TemporaryBanError, so the caller can pace retries
+// with a long cooldown instead of hammering the API. Returns nil for any
+// other error.
+func banFromHTTPError(err error) error {
+	var he *HTTPError
+	if errors.As(err, &he) &&
+		(he.StatusCode == http.StatusForbidden || he.StatusCode == http.StatusTooManyRequests) {
+		return TemporaryBanError
+	}
+	return nil
+}
+
 func (c *Client) backgroundInit(ctx context.Context, hc *http.Client, userUUID string) (BgInitResponse, error) {
 	postData := make(url.Values)
 	postData.Add("login", "1")
@@ -107,6 +139,9 @@ func (c *Client) backgroundInit(ctx context.Context, hc *http.Client, userUUID s
 	qs.Add("uuid", userUUID)
 	resp, err := c.doReq(ctx, hc, "POST", bgInitURL, qs, postData)
 	if err != nil {
+		if berr := banFromHTTPError(err); berr != nil {
+			return BgInitResponse{}, berr
+		}
 		return BgInitResponse{}, err
 	}
 	var res BgInitResponse
@@ -146,6 +181,9 @@ func (c *Client) zgetTunnels(ctx context.Context, hc *http.Client, userUUID stri
 	params.Add("is_premium", "0")
 	data, err := c.doReq(ctx, hc, "POST", zgetTunnelsURL, params, nil)
 	if err != nil {
+		if berr := banFromHTTPError(err); berr != nil {
+			return nil, berr
+		}
 		return nil, err
 	}
 	var tunnels ZGetTunnelsResponse
@@ -153,7 +191,14 @@ func (c *Client) zgetTunnels(ctx context.Context, hc *http.Client, userUUID stri
 		return nil, fmt.Errorf("unable to unmashal zgettunnels response: %w", err)
 	}
 	if len(tunnels.IPList) == 0 {
-		return nil, EmptyResponseError
+		// Include a body snippet for diagnosability: Hola returns an empty
+		// ip_list for nonexistent pools (wrong country/pool name) and for
+		// exhausted quotas, and the raw body often hints which one it is.
+		snippet := strings.TrimSpace(string(data))
+		if len(snippet) > 300 {
+			snippet = snippet[:300] + "..."
+		}
+		return nil, fmt.Errorf("%w (an empty ip_list usually means a -country absent from Hola's catalog or a nonexistent pool for -proxy-type): %s", EmptyResponseError, snippet)
 	}
 	return &tunnels, nil
 }
@@ -162,10 +207,7 @@ func (c *Client) zgetTunnels(ctx context.Context, hc *http.Client, userUUID stri
 // retries with each fallback agent in turn. It is the single retry/fallback
 // orchestration point for this package.
 func (c *Client) EnsureTransaction(ctx context.Context, getFBTimeout time.Duration, txn func(context.Context, *http.Client) bool) (bool, error) {
-	client := c.httpClientWithProxy(nil)
-	defer client.CloseIdleConnections()
-
-	if txn(ctx, client) {
+	if txn(ctx, c.httpClientWithProxy(nil)) {
 		return true, nil
 	}
 
@@ -177,9 +219,10 @@ func (c *Client) EnsureTransaction(ctx context.Context, getFBTimeout time.Durati
 	}
 
 	for _, agent := range fbc.Agents {
-		client = c.httpClientWithProxy(&agent)
-		defer client.CloseIdleConnections()
-		if txn(ctx, client) {
+		client := c.httpClientWithProxy(&agent)
+		ok := txn(ctx, client)
+		client.CloseIdleConnections()
+		if ok {
 			return true, nil
 		}
 	}

@@ -20,9 +20,9 @@ import (
 )
 
 const (
-	proxyConnectMethod        = "CONNECT"
-	proxyHostHeader           = "Host"
-	proxyAuthorizationHeader  = "Proxy-Authorization"
+	proxyConnectMethod       = "CONNECT"
+	proxyHostHeader          = "Host"
+	proxyAuthorizationHeader = "Proxy-Authorization"
 )
 
 // ProxyDialer establishes a CONNECT tunnel through a Hola HTTPS proxy.
@@ -93,6 +93,12 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 	if err != nil {
 		return nil, err
 	}
+	ok := false
+	defer func() {
+		if !ok {
+			conn.Close()
+		}
+	}()
 
 	if d.tlsServerName != "" {
 		// Custom cert verification logic:
@@ -102,7 +108,7 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 		if d.hideSNI {
 			sni = ""
 		}
-		conn = utls.UClient(conn, &utls.Config{
+		tlsConn := utls.UClient(conn, &utls.Config{
 			ServerName:         sni,
 			InsecureSkipVerify: true,
 			VerifyConnection: func(cs utls.ConnectionState) error {
@@ -118,6 +124,10 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 				return err
 			},
 		}, utls.HelloChrome_Auto)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			return nil, err
+		}
+		conn = tlsConn
 	}
 
 	req := &http.Request{
@@ -156,6 +166,7 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 		}
 		return nil, fmt.Errorf("bad response from upstream proxy server: %s", proxyResp.Status)
 	}
+	ok = true
 	return conn, nil
 }
 

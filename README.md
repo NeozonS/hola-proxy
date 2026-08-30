@@ -4,7 +4,7 @@ Standalone Hola proxy client. Запускается локально и под�
 
 Это форк [Snawoot/hola-proxy](https://github.com/Snawoot/hola-proxy) с переработанной структурой и обновлёнными зависимостями. Ключевые отличия от оригинала:
 
-- HTTP-клиент на [`enetx/surf`](https://github.com/enetx/surf) с Chrome v145 JA3 fingerprint и порядком заголовков как у настоящего браузера
+- HTTP-клиент на [`enetx/surf`](https://github.com/enetx/surf) с Chrome v150 JA3 fingerprint, Windows UA и заголовками как у расширения Hola
 - TLS-туннель к Hola-агентам с актуальным Chrome ClientHello (`utls.HelloChrome_Auto`) вместо устаревшего `HelloAndroid_11_OkHttp`
 - Стандартная Go-структура (`cmd/` + `internal/`), без глобальных мутабельных переменных
 - Hola API инкапсулирован в `hola.Client{}` struct с явной конфигурацией
@@ -149,7 +149,7 @@ curl -x http://127.0.0.1:8080 https://ifconfig.me
 | `-resolver` | string | DoH/DoT-резолвер (по умолчанию Cloudflare DoH) |
 | `-cafile` | string | путь к кастомному CA bundle |
 | `-proxy` | string | базовый прокси для всех соединений: `<http\|https\|socks5\|socks5h>://[login:password@]host[:port]` |
-| `-user-agent` | string | переопределить User-Agent (по умолчанию — актуальный Chrome для Windows) |
+| `-user-agent` | string | переопределить User-Agent (по умолчанию — Windows Chrome, совпадающий с TLS-impersonate) |
 | `-ext-ver` | string | версия расширения Hola (по умолчанию определяется автоматически) |
 | `-hide-SNI` | bool | скрывать SNI в TLS к Hola-агентам (по умолчанию `true`) |
 | `-backoff-initial` | duration | стартовая задержка backoff'а для `zgettunnels` |
